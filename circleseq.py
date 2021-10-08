@@ -8,6 +8,7 @@ import plotly
 import plotly.graph_objs as go
 import pymultiscale.anscombe
 import statsmodels.stats.multitest
+from logging import getLogger, Formatter, StreamHandler, FileHandler, DEBUG, INFO, ERROR, CRITICAL, FATAL
 
 """
 CIRCLE-seq processing program.
@@ -85,13 +86,15 @@ def _load_bed(filename)->dict:
                 # detection.append((chrom, position, num))
     return detection
 
-def evaluate_enrichment(arguments=None)->str:
+def evaluate_enrichment(arguments=None, logger=None)->str:
     """Evaluate mapped reads
     Arguments:
         --track filenames (bed/wig/bedGraph)
         -w window size    
         -o output directory
         --verbose verbosity
+        --without-control compare with background mappability
+        --forced force calculation even if results are saved
     Return:
         statistics filename
     """
@@ -103,10 +106,11 @@ def evaluate_enrichment(arguments=None)->str:
         parser.add_argument('-o', default='circleseq_out', metavar='directory', help='output directory')
         parser.add_argument('--verbose', action='store_true')
         parser.add_argument('--forced', action='store_true')
+        parser.add_arguemnt('--without-control', action='store_true')
         parser.add_argument('--cutoff', type=int, default=10, help='cutoff counts of statistical evaluation')
         parser.add_argument('-w', type=int, default=1, metavar='number', help='window size', choices=range(1, 500))
         args = parser.parse_known_args(arguments)[0]
-
+    logger = logger if logger is not None else getLogger() 
     outdir = args.o
     os.makedirs(outdir, exist_ok=True)
 
@@ -115,7 +119,10 @@ def evaluate_enrichment(arguments=None)->str:
     allsites = {}
     window_size = args.w
     verbose = args.verbose
+    if args.verbose:
+        logger.setLevel(DEBUG)
     cutoff = args.cutoff
+    wo_control = args.without_control
     forced = args.forced
     n_total = []
     fn_output = os.path.join(outdir, 'stat.tsv')
@@ -131,11 +138,8 @@ def evaluate_enrichment(arguments=None)->str:
     n_inputs = len(track_filenames)
     n_test_sites = 0
     for file_index, filename in enumerate(track_filenames):
-        if verbose:
-            sys.stderr.write('loading {}\r'.format(filename))
         ext = filename.split('.')[-1]
-        if verbose:
-            sys.stderr.write('\033[Kloading {} : '.format(filename))
+        logger.info('\033[Kloading "{}"'.format(filename))
         if ext == 'bed' or 'bedGraph':
             sites = _load_bed(filename)
         elif ext == 'wig':
@@ -161,11 +165,9 @@ def evaluate_enrichment(arguments=None)->str:
                 allsites[c][wn][file_index] += n
                 n_reads += n
         n_total.append(n_reads)
-        if verbose:
-            sys.stderr.write(' => {}\t{}\t{}\n'.format(title, n_pos, n_reads))
+        logger.info('{} loaded, title={}, n_pos={}, n_reads={}'.format(filename, title, n_pos, n_reads))
 
-    if verbose:
-        sys.stderr.write('{} positions are under test\n'.format(n_test_sites))    
+    logger.debug('{} cleavvage sites are under test'.format(n_test_sites))    
 
     if cutoff > 0:
         n_selected = 0
@@ -177,8 +179,7 @@ def evaluate_enrichment(arguments=None)->str:
                     n_selected += 1
                     print(cnt)
             allsites[chrom] = filtered
-        if verbose:
-            sys.stderr.write('{}/{} sites were selected\n'.format(n_selected, n_test_sites))
+        logger.debug('cutoff process selected {}/{} sites'.format(n_selected, n_test_sites))
         n_test_sites = n_selected
 
     chromosomes = list(sorted(allsites.keys()))
@@ -187,12 +188,18 @@ def evaluate_enrichment(arguments=None)->str:
     count_table = []
 
     df_header = ['Chromosome', 'Start', 'Stop'] + titles
-    for i in range(n_inputs):
-        for j in range(i + 1, n_inputs):
-            df_header.append('lFC_{}_{}'.format(titles[i], titles[j]))
-            df_header.append('pVal_{}_{}'.format(titles[i], titles[j]))
+    if without_control:
+        for i in range(n_inputs):
+            df_header.append('lFC_{}'.format(titles[i]))
+            df_header.append('pVal_{}'.format(titles[i]))
+    else:
+        for i in range(n_inputs):
+            for j in range(i + 1, n_inputs):
+                df_header.append('lFC_{}_{}'.format(titles[i], titles[j]))
+                df_header.append('pVal_{}_{}'.format(titles[i], titles[j]))
 
     n_processed = 0
+        
     for chromosome in chromosomes:
         for position in sorted(allsites[chromosome].keys()):
             n_mapped = allsites[chromosome][position]
@@ -205,32 +212,44 @@ def evaluate_enrichment(arguments=None)->str:
             except Exception as e:
                 sys.stderr.write(repr(n_mapped) + ' ' + repr(e) + '\n')
                 continue
-            for i in range(n_inputs):
-                for j in range(i + 1, n_inputs):
-                    logfc = np.log2(tval[j] * vst_total[i] / (tval[i] * vst_total[j]))
-                    if logfc > 0:
-                        prob_ = tval[i] / vst_total[i]
-                        obs_ = tval[j]
-                        # print('prob, obs={:.3f}, {:.3f}'.format(prob_, obs_))
-                        pvalue = scipy.stats.nbinom.cdf(vst_total[j], obs_, prob_)
+            if without_control:
+                ####################################################
+                for i in range(n_inputs):
+                    total = vst_total[i]
+                    if n_mapped[i] > 0: #
+                        logfc = np.log2(n_counts[i] * n_sites[i] / n_total[i])
+                        pvalue = scipy.stats.nbinom.cdf(vst_total[i], tval[i], tval[i] / vst_total[i])
+                        pass
                     else:
-                        prob_ = tval[j] / vst_total[j]
-                        obs_ = tval[i]
-                        pvalue = scipy.stats.nbinom.cdf(vst_total[i], obs_, prob_)
-                    if pvalue < 1e-200:
-                        logpvalue = 200
-                    else:
-                        logpvalue = -np.log10(pvalue)
-                    # print(i, j, logfc, pvalue, tval[j], tval[i])
+                        logfc = 0.0
+                        pvalue = 1.0
                     row += [logfc, pvalue]
+            else: 
+                for i in range(n_inputs):
+                    for j in range(i + 1, n_inputs):
+                        logfc = np.log2(tval[j] * vst_total[i] / (tval[i] * vst_total[j]))
+                        if logfc > 0:
+                            prob_ = tval[i] / vst_total[i]
+                            obs_ = tval[j]
+                            # print('prob, obs={:.3f}, {:.3f}'.format(prob_, obs_))
+                            pvalue = scipy.stats.nbinom.cdf(vst_total[j], obs_, prob_)
+                        else:
+                            prob_ = tval[j] / vst_total[j]
+                            obs_ = tval[i]
+                            pvalue = scipy.stats.nbinom.cdf(vst_total[i], obs_, prob_)
+                        # if pvalue < 1e-200:
+                        #     logpvalue = 200
+                        # else:
+                        #     logpvalue = -np.log10(pvalue)
+                        # print(i, j, logfc, pvalue, tval[j], tval[i])
+                        row += [logfc, pvalue]
 
             count_table.append(row)
-            # if verbose:
-            #     sys.stderr.write('\033[K{}\r'.format('\t'.join([str(x_) for x_ in row])))
-            if verbose:
+            if logger.getEffectiveLevel() <= DEBUG:
                 sys.stderr.write('\033[K {:.1f}% {}:{}\r'.format(n_processed * 100 / n_test_sites, chromosome, position))
             n_processed += 1
-    if verbose: sys.stderr.write('\033[K\r')    
+    if logger.getEffectiveLevel() <= DEBUG:
+        sys.stderr.write('\033[K\r')    
 
     df = pd.DataFrame(count_table, columns=df_header)
     dfs = []
@@ -251,12 +270,16 @@ def load_blacklist(filename:str, **kwargs)->dict:
     """
     import gzip, io
     verbose = kwargs.get('verbose', False)
+    logger = kwargs.get('logger', getLogger())
+    if verbose: logger.setLevel(DEBUG)
     if filename.endswith('.gz'):
         istr = io.TextIOWrapper(gzip.open(filename), encoding='utf-8')
     else:
         istr = open(filename)
     bl = {}
     chromosomes = {}
+    n_bases = 0
+    n_regions = 0
     for line in istr:
         items = line.strip().split('\t')
         if len(items) >= 3 and items[0].startswith('chr'):
@@ -265,24 +288,28 @@ def load_blacklist(filename:str, **kwargs)->dict:
             group = items[3]
             if group not in bl:bl[group] = 0
             bl[group] += stop - start
-            # chromosomes[items[0]] = 
             chrom = items[0]
+            n_bases += stop - start
+            n_regions += 1
             if chrom not in chromosomes:
                 chromosomes[chrom] = [(start, stop)]
             else:
                 chromosomes[chrom].append((start, stop))
-    if verbose:
-        sys.stderr.write('Blacklist\tsize\n')
-        for group in bl.keys():
-            sys.stderr.write('{}\t{}\n'.format(group, bl[group]))
+    # if verbose:
+    n_chrom = len(chromosomes)
+    logger.info('Blacklist on {} chromosomes, {} sites, {} bases'.format(n_chrom, n_regions, n_bases))
+        # sys.stderr.write('Blacklist\tsize\n')
+        # for group in bl.keys():
+        #     sys.stderr.write('{}\t{}\n'.format(group, bl[group]))
     istr.close()
     return chromosomes
 
-def load_chromosome_sizes(build_version:str='mm10', cache:str=None)->dict:
+def load_chromosome_sizes(build_version:str='mm10', *, cache:str=None, logger=None)->dict:
     """Load chromosome size of certain build version from UCSC
     Return : dictionay {'size':dictionary of chromosome and length pair, 
     'filename':'container filename'}
     """
+    logger = logger if logger is not None else getLogger()
     if cache is None:
         cache_dir = os.path.expanduser('~/.chrom.sizes')
         os.makedirs(cache_dir, exist_ok=True)
@@ -312,10 +339,12 @@ def load_chromosome_sizes(build_version:str='mm10', cache:str=None)->dict:
                     chrom[items[0]] = int(items[1])
         return {'filename':cache,  'size':chrom}
     else:
+        logger.error('cannot load chromosome size from {}'.format(url))
         raise Exception('cannot load contents from {}'.format(url))
 
-def count_cutsites(arguments=None):
+def count_cutsites(arguments=None, *, logger=None):
     """Read SAM/BAM file and count mapped tags, alignment files *MUST BE SORTED BY NAME* """
+    logger = getLogger() if logger is None else logger
     if isinstance(arguments, argparse.Namespace):
         args = arguments
     else:
@@ -336,11 +365,15 @@ def count_cutsites(arguments=None):
     fn_blacklist = args.blacklist
     os.makedirs(outdir, exist_ok=1)
     fn_info = os.path.join(outdir, 'count.info')
+    bamfiles = args.b
+
+    if verbose:
+        logger.setLevel(DEBUG)
 
     output_filenames = []
 
     if fn_blacklist is not None and os.path.exists(fn_blacklist):
-        blacklist = load_blacklist(fn_blacklist, verbose=verbose)
+        blacklist = load_blacklist(fn_blacklist, verbose=verbose, logger=logger)
     else:
         blacklist = {}
 
@@ -355,10 +388,12 @@ def count_cutsites(arguments=None):
     xpos = np.arange(0, 101, 1)
 
     # Load BAM files and convert to bedgraph
-    for fn in args.b: 
+    file_index = 0
+    for fn in bamfiles:
         label = os.path.basename(fn).split('.')[0]
         fn_out = os.path.join(outdir, label + '.bedgraph')
         fn_dist = os.path.join(outdir, label + '.tsv')
+        logger.info('{}/{} : {}'.format(file_index + 1, len(bamfiles), fn))
 
         if not forced and os.path.exists(fn_out) and os.path.getsize(fn_out) > 100:
             if verbose:
@@ -431,6 +466,8 @@ def count_cutsites(arguments=None):
                 results[current_chrom].append(cleavage_site)
         
         # remove counts in blacklist
+        if len(blacklist) > 0:
+            logger.info('removing blacklist')
         n_removed_total = 0
         for chrom in results.keys():
             if chrom not in blacklist: continue
@@ -471,14 +508,13 @@ def count_cutsites(arguments=None):
                             break
                         i += 1
             n_removed_total += sum(flags)
-            if verbose:
-                sys.stderr.write('\033[K{}\t{} reads were removed\r'.format(chrom, sum(flags)))
             results[chrom] = [positions[i] for i in range(len(positions)) if not flags[i]]
-        if verbose:
-            sys.stderr.write('\033[K{} reads in blacklist were removed\n'.format(n_removed_total))
+        if n_removed_total > 0:
+            logger.info('{} reads in blacklist regions were removed'.format(n_removed_total))
         freq = {}
         output_filenames.append(fn_out)
         n_sites = n_sites_plus = 0
+        logger.info('writing bedGraph')
         with open(fn_out, 'w') as fo:
             name = '{};total={};tolerance={}'.format(label, n_pairs, tolerance)
             if cutoff > 0:
@@ -496,14 +532,13 @@ def count_cutsites(arguments=None):
                     if n > cutoff:
                         n_sites_plus += n
                         fo.write('{}\t{}\t{}\t{}\n'.format(chrom, p, p + 1, n))
+        logger.info('writing statistics')
         with open(fn_dist, 'w') as fo:
             fo.write('num_reads\tcount\n')
             for c in sorted(freq.keys()):
                 fo.write('{}\t{}\n'.format(c, freq[c]))
-
-        if verbose:
-            sys.stderr.write('\033[K{}\t{}\t{}\t{}\n'.format(fn, n_reads, n_pairs, n_sites))
         fi.close()
+        logger.info('{} contains {} reads, {} pairs, {} sites'.format(fn, n_reads, n_pairs, n_sites))
         if proc is not None:
             proc.stdout.close()
             proc.wait()
@@ -516,13 +551,16 @@ def count_cutsites(arguments=None):
             fo.write('n_cleavage_sites:{}:{}\n'.format(label, n_sites))
     return output_filenames # returns bedgraph filenames
 
-def detect_cleavage_site(reads, chromosome:str, tolerance:int=4, max_distance:int=2000, verbose:bool=False)->int:
+def detect_cleavage_site(reads, chromosome:str, tolerance:int=4, max_distance:int=2000, *, verbose:bool=False, logger=None)->int:
     """Detection of CIRCLE-seq cleavage sites using positions of mapped reads and 
     SAM file flag information
     If multiple sites were proposed by the alignments, most frequenct location is proposed.
 
     Return : Detected position
     """
+    logger = logger if logger is not None else getLogger()
+    if verbose:
+        logger.setLevel(DEBUG)
     # divide into first/second pair group
     if len(reads) < 2:
         return -1
@@ -556,9 +594,9 @@ def detect_cleavage_site(reads, chromosome:str, tolerance:int=4, max_distance:in
     sites = [p for p in positions.keys() if positions[p] == maxcnt]
     return sites[np.random.randint(0, len(sites))]
 
-
-def load_chromosome_size(build_version='hg38', cache=None):
+def load_chromosome_size(build_version='hg38', *, cache=None, logger=None):
     """Load chromosome size of certain build version from UCSC"""
+    logger = logger if logger is not None else getLogger()
     if cache is None:
         cache_dir = os.path.expanduser('~/.chrom.sizes')
         os.makedirs(cache_dir, exist_ok=True)
@@ -590,11 +628,12 @@ def load_chromosome_size(build_version='hg38', cache=None):
     else:
         raise Exception('cannot load contents from {}'.format(url))
 
-def display_results(arguments=None)->dict:
+def display_results(arguments=None, *, logger=None)->dict:    
     """Draw significantly enriched positions.
     Return : {excel:excel filename, 
               chart:PDF filename}
     """
+    logger = logger if logger is not None else getLogger()
     import reportlab.pdfgen.canvas
     import openpyxl
     import subsequence
@@ -628,6 +667,8 @@ def display_results(arguments=None)->dict:
     height = max(0, min(1000, geom[1]))
     margin = min(100, max(25, width / 4))
     span = args.span
+    if args.verbose:
+        logger.setLevel(DEBUG)
     if title is None: title = re.split('\\W', os.path.basename(filename_tsv))[0]
 
     outdir = args.o
@@ -787,8 +828,7 @@ def display_results(arguments=None)->dict:
                     y = ycnv(count[j])
                     cnv.rect(x - .5, y0, 1, y - y0, 0, 1)
                     used.add(chromosome)
-                    if verbose:
-                        sys.stderr.write('{}\t{}\t{}:{}\t{}\t{}\n'.format(i, j, chromosome, pos, count[j], y - y0))
+                    logger.info('{}\t{}\t{}:{}\t{}\t{}'.format(i, j, chromosome, pos, count[j], y - y0))
             cnv.setStrokeColor('black')
             cnv.setFillColor('black')
             graph_label = '{} {} {}'.format(sample_names[index_0], '<>'[i], sample_names[index_1])
@@ -816,10 +856,19 @@ def display_results(arguments=None)->dict:
     cnv.save()
     return {'chart':filename_chart, 'spreadsheet':filename_excel}
 
+def _get_code(params):
+    import hashlib
+    md5 = hashlib.md5()
+    for key in sorted(params.keys()):
+        val = params[key]
+        md5.update('{}={};'.format(str(key), str(val)).encode('utf8'))
+    code = md5.hexdigest()
+    return code
 
-def align_reads(arguments=None):
+def align_reads(arguments=None, logger=None):
     """Align paired-end reads on genome and return BAM file(s) sorted by sequence ID.
     """
+    logger = logger if logger is not None else getLogger()
     if isinstance(arguments, argparse.Namespace):
         args = arguments
     else:
@@ -834,6 +883,7 @@ def align_reads(arguments=None):
         parser.add_argument('--title', default=None, metavar='string', help='title of the data')
         parser.add_argument('--forced', action='store_true', help='force alignment even if BAM file exists')
         parser.add_argument('-p', type=int, default=0)
+        code = None
         args = parser.parse_args(arguments)[0]
 
     verbose = args.verbose
@@ -848,10 +898,14 @@ def align_reads(arguments=None):
         import multiprocessing
         num_threads = multiprocessing.cpu_count()
 
+    # automatic arrange R1 and R2 sequences
     r1seq = args.r1
     r2seq = args.r2
     titles = []
     if r1seq is None or r2seq is None:
+        if args.fastq is None:
+            logger.error('no fastq files given')
+            raise Exception('no fastq files')
         import collections
         r1seq = []
         r2seq = []
@@ -869,8 +923,7 @@ def align_reads(arguments=None):
                 titles.append(label)
                 r1seq.append(r1_)
                 r2seq.append(r2_)
-                if verbose:
-                    sys.stderr.write('{}\t{}\t{}\n'.format(label, r1_, r2_))
+                logger.info('{} <- {}/{}'.format(label, os.path.basename(r1_), os.path.basename(r2_)))
     else:
         r1seq = args.r1
         r2seq = args.r2
@@ -881,6 +934,9 @@ def align_reads(arguments=None):
         r1 = r1seq[index]
         r2 = r2seq[index]
         bam_title = titles[index]
+        if bt2_db is None:
+            logger.error("no bowtie2 database is given")
+            raise Exception('no bt2 database')
 
         os.makedirs(outdir, exist_ok=True)
         samfile = os.path.join(outdir, bam_title + '.sam')
@@ -889,17 +945,26 @@ def align_reads(arguments=None):
         if forced or (os.path.exists(samfile) is False or os.path.getsize(samfile) < 1000):
             cmd = (bt2, '-x', bt2_db, '-p', str(num_threads),
                 '-1', r1, '-2', r2, '-S', samfile, '--very-sensitive-local')
-            if verbose:
-                sys.stderr.write(' '.join(cmd) + '\n')
-            subprocess.Popen(cmd).wait()
+            logger.info(' '.join(cmd))
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            for line in proc.stdout:
+                logger.info(line)
+            errocode = proc.wait()
+            proc.stdout.close()
+            del proc
+            if errorcode < 0:
+                logger.error("bowtie2 eror with code {}".format(errorcode))
+                os.unlink(samfile)
             if os.path.exists(samfile) is False:
                 raise Exception('failure of alignment\n')
 
         if forced or (os.path.exists(bamfile) is False or os.path.getsize(bamfile) < 1000):
             cmd = 'samtools', 'sort', '-n', '-o', bamfile, samfile
-            if verbose:
-                sys.stderr.write(' '.join(cmd) + '\n')
-            subprocess.Popen(cmd).wait()
+            logger.info(' '.join(cmd))
+            err = subprocess.Popen(cmd).wait()
+            if err < 0:
+                logger.error("samtools sort faled with code {}".format(err))
+                os.unlink(bamfile)
             if os.path.exists(bamfile) is False:
                 raise Exception('failure of conversion to bam')
         bamfiles.append(bamfile)
@@ -907,7 +972,11 @@ def align_reads(arguments=None):
     return bamfiles
 
 def main():
-    #pipeline(arguments=None):
+    """
+    command map/count/eval/show
+    """
+
+    logger = getLogger(__name__)
     parser = argparse.ArgumentParser()
 
     preferences = {
@@ -950,6 +1019,7 @@ def main():
     parser.add_argument('--blacklist', metavar='filename', help='blacklist')
 
     # evaluate
+    parser.add_argument('--without-control', help='evaluate count without control')
     parser.add_argument('--track', nargs='+', metavar='bed/bedGraph/wig filenames', help='whole-genome track of cleavage sites')
     parser.add_argument('-w', type=int, default=5, metavar='int', help='window size of analysis, >0')
 
@@ -961,47 +1031,77 @@ def main():
     parser.add_argument('--geometry', default='800x300')
     parser.add_argument('--span', type=int, default=16)
 
+    parser.add_argument('--log', default=None)
+
     args, cmds = parser.parse_known_args()
     forced = args.forced
     outdir = args.o
     os.makedirs(outdir, exist_ok=True)
 
-    processed = False
-
-    if 'map' in cmds: 
-        bamfiles = align_reads(args)
-        if 'b' in args:
-            sys.stderr.write('BAM files were overwritten as generated.')
-        args.b = bamfiles
-        processed = True
-    if 'count' in cmds:
-        bedgraph_files = count_cutsites(args)
-        args.track = bedgraph_files        
-        processed = True
-    if 'compare' in cmds:
-        summary_file = evaluate_enrichment(args)
-        args.i = summary_file
-        processed = True
-    if 'show' in cmds:
-        display_results(args)
-        processed = True
-    if not processed: # do all
-        if 'b' not in args or args.b is None or len(args.b) == 0 or os.path.exists(args.b[0]) is False or forced:
-            sys.stderr.write('aligning...\n')
-            bamfiles = align_reads(args)
-            args.b = bamfiles
-        if 'track' not in args or args.track is None or len(args.track) == 0 or os.path.exists(args.track[0]) is False or forced:
-            sys.stderr.write('track...\n')
-            bedgraph_files = count_cutsites(args)
-            args.track = bedgraph_files        
-        if 'i' not in args or args.i is None or forced:
-            sys.stderr.write('-i argment was ignored')
-            summary_file = evaluate_enrichment(args)
-            args.i = summary_file
-        display_results(args)
     fn_info = os.path.join(outdir, 'run.info')
-    with open(fn_info, 'w') as fo:
-        json.dump(vars(args), fo, indent=2)
+    if os.path.exists(fn_info):
+        with open(fn_info) as fi:
+            for key, val in json.load(fi).items():
+                preferences[key] = val
+    else:
+        preferences = vars(args)
 
+    processed = False
+    verbose = args.verbose
+
+    # set logging
+    def _set_log_handler(logger, handler):#, verbose):
+        handler.setFormatter(Formatter('%(asctime)s %(name)s:%(lineno)s %(funcName)s [%(levelname)s]: %(message)s'))
+        logger.addHandler(handler)
+        return logger
+    logfile= args.log
+    if logfile is None:
+        import tempfile
+        logfile = tempfile.mktemp()#dtemp()
+    _set_log_handler(logger, StreamHandler())
+    _set_log_handler(logger, FileHandler(logfile))
+    if verbose:
+        logger.setLevel(DEBUG)
+    else:
+        logger.setLevel(ERROR)
+    logger.propagate = False
+
+    try:
+        if 'map' in cmds: 
+            bamfiles = align_reads(args, logger=logger)
+            if 'b' in args:
+                sys.stderr.write('BAM files were overwritten as generated.')
+            args.b = bamfiles
+            processed = True
+        if 'count' in cmds:
+            bedgraph_files = count_cutsites(args, logger=logger)
+            args.track = bedgraph_files        
+            processed = True
+        if 'eval' in cmds:
+            summary_file = evaluate_enrichment(args, logger=logger)
+            args.i = summary_file
+            processed = True
+        if 'show' in cmds:
+            display_results(args, logger=logger)
+            processed = True
+        if not processed: # do all
+            if 'b' not in args or args.b is None or len(args.b) == 0 or os.path.exists(args.b[0]) is False or forced:
+                sys.stderr.write('aligning...\n')
+                bamfiles = align_reads(args, logger=logger)
+                args.b = bamfiles
+            if 'track' not in args or args.track is None or len(args.track) == 0 or os.path.exists(args.track[0]) is False or forced:
+                sys.stderr.write('track...\n')
+                bedgraph_files = count_cutsites(args, logger=logger)
+                args.track = bedgraph_files        
+            if 'i' not in args or args.i is None or forced:
+                sys.stderr.write('-i argment was ignored')
+                summary_file = evaluate_enrichment(args, logger=logger)
+                args.i = summary_file
+            display_results(args)
+        with open(fn_info, 'w') as fo:
+            json.dump(vars(args), fo, indent=2)
+    except Exception as e:
+        logger.error('Process interrupted : {}'.format(str(e)))
+        raise
 if __name__ == '__main__':
     main()
